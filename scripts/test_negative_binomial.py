@@ -26,13 +26,26 @@ def load_paths_dict(paths_dict_file):
     """Load the paths dictionary from the compressed JSON file."""
     with gzip.open(paths_dict_file, 'rt') as f:
         return json.load(f)
+def scanpy_norm_log1p_from_torch(X: torch.Tensor) -> torch.Tensor:
+    # move to CPU + numpy (Scanpy expects numpy/scipy)
+    X_np = X.detach().cpu().numpy().astype(np.float32, copy=False)
+
+    adata = sc.AnnData(X_np)                 # create AnnData
+    sc.pp.normalize_total(adata, target_sum=None, inplace=True)  # Scanpy normalize_total
+    sc.pp.log1p(adata)                       # Scanpy log1p (natural log)
+
+    # back to torch, preserve original device & dtype
+    X_out = torch.from_numpy(adata.X).to(X.device).type_as(X)
+    return X_out 
 
 def training_negative_binomial(path_name, base_dir,device="cpu",batch_size=128,lr=1e-3,weight_decay=1e-5,early_stopping=True,patience=200,epochs=700,min_delta=1e-4):
-    model_prior = GaussianMixture(latent_dim=1, num_clusters=5)
+    data = anndata.read_loom(f"{base_dir}/{path_name}.loom")
+    n_components = len(set(data.obs['lineage']))
+    model_prior = GaussianMixture(latent_dim=1, num_clusters=n_components)
     model_encoder = build_encoder(dim_x=2000, h_dim=64, n_layers=2)
     model_decoder = build_decoder_nb(dim_x=2000, latent_dim=1, h_dim=64, n_layers=2)
     model = EmpiricalBayesVariationalAutoencoder(encoder=model_encoder, enc_out_dim=64, decoder=model_decoder, prior=model_prior).to(device)
-    data = anndata.read_loom(f"{base_dir}/{path_name}.loom")
+    
     # Convert sparse matrix to dense and then to tensor
     X_dense = torch.tensor(data.X.todense(), dtype=torch.float32)
     dl = DataLoader(TensorDataset(X_dense), batch_size=batch_size, shuffle=True)
@@ -48,6 +61,9 @@ def training_negative_binomial(path_name, base_dir,device="cpu",batch_size=128,l
         n = 0
         epoch_losses = {}
         for (xb,) in dl:
+            if xb.size(0) == 1:
+                print(f"Warning: xb.size(0) == 1, skipping batch")
+                continue
             xb = xb.to(device).float()
             loss, _ = model.variational_inference_step(xb, opt)
             losses = {"loss": loss}
@@ -196,7 +212,10 @@ def main():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     rows = []
     cnt = 0
-    for path in paths_dict:
+    for i, path in enumerate(sorted(paths_dict.keys())):
+        # if i % 2 == 0:
+        if os.path.exists(f"{result_dir}/{path}/NB_GMM_histogram.png"):
+            continue
         print(f"Training {path}...")
         model, losses_history = training_negative_binomial(path, base_dir,device=device)
         mu_q, z, labels, rho, pval, gmm_metrics, mixture_metrics = evaluate_negative_binomial(model, path, base_dir,device=device)

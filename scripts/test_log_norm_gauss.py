@@ -21,22 +21,46 @@ from sklearn.mixture import GaussianMixture as GaussianMixture_sklearn
 from sklearn.metrics import silhouette_score, adjusted_rand_score
 from scipy.stats import entropy
 from scipy.spatial.distance import jensenshannon
+import fcntl
+import scanpy as sc
+def safe_read_h5ad(filepath):
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            with open(filepath, 'r') as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_SH)  # Shared lock for reading
+                return anndata.read_h5ad(filepath)
+        except (IOError, OSError):
+            if attempt < max_retries - 1:
+                time.sleep(1)
+            else:
+                raise IOError(f"Failed to read {filepath} after {max_retries} attempts")
 
 def load_paths_dict(paths_dict_file):
     """Load the paths dictionary from the compressed JSON file."""
     with gzip.open(paths_dict_file, 'rt') as f:
         return json.load(f)
+def scanpy_norm_log1p_from_torch(X: torch.Tensor) -> torch.Tensor:
+    # move to CPU + numpy (Scanpy expects numpy/scipy)
+    X_np = X.detach().cpu().numpy().astype(np.float32, copy=False)
 
+    adata = sc.AnnData(X_np)                 # create AnnData
+    sc.pp.normalize_total(adata, target_sum=None, inplace=True)  # Scanpy normalize_total
+    sc.pp.log1p(adata)                       # Scanpy log1p (natural log)
+
+    # back to torch, preserve original device & dtype
+    X_out = torch.from_numpy(adata.X).to(X.device).type_as(X)
+    return X_out 
 def training_log_norm_gauss(path_name, base_dir,device="cpu",batch_size=128,lr=1e-3,weight_decay=1e-5,early_stopping=True,patience=200,epochs=700,min_delta=1e-4):
-    model_prior = GaussianMixture(latent_dim=1, num_clusters=5)
+    data = anndata.read_loom(f"{base_dir}/{path_name}.loom")
+    n_components = len(set(data.obs['lineage']))
+    model_prior = GaussianMixture(latent_dim=1, num_clusters=n_components)
     model_encoder = build_encoder(dim_x=2000, h_dim=64, n_layers=2)
     model_decoder = build_decoder_gaussian(dim_x=2000, latent_dim=1, h_dim=64, n_layers=2)
     model = EmpiricalBayesVariationalAutoencoder(encoder=model_encoder, enc_out_dim=64, decoder=model_decoder, prior=model_prior).to(device)
-    data = anndata.read_loom(f"{base_dir}/{path_name}.loom")
     # Convert sparse matrix to dense and then to tensor
     X_dense = torch.tensor(data.X.todense(), dtype=torch.float32)
-    # Log transform the data
-    X_dense = torch.log1p(X_dense)
+    X_dense = scanpy_norm_log1p_from_torch(X_dense)
     dl = DataLoader(TensorDataset(X_dense), batch_size=batch_size, shuffle=True)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     model.train()
@@ -50,6 +74,9 @@ def training_log_norm_gauss(path_name, base_dir,device="cpu",batch_size=128,lr=1
         n = 0
         epoch_losses = {}
         for (xb,) in dl:
+            if xb.size(0) == 1:
+                print(f"Warning: xb.size(0) == 1, skipping batch")
+                continue
             xb = xb.to(device).float()
             loss, _ = model.variational_inference_step(xb, opt)
             losses = {"loss": loss}
@@ -173,7 +200,7 @@ def fit_gmm_and_analyze(adata, latent_key):
 
 def evaluate_log_norm_gauss(model, path, base_dir,device="cpu"):
     model.eval()
-    data = anndata.read_h5ad(f"{base_dir}/scvi_path_{path}/trained.h5ad")
+    data = safe_read_h5ad(f"{base_dir}/scvi_path_{path}/trained.h5ad")
     y = data.obs["lineage"]
     X = torch.tensor(data.X.todense(), dtype=torch.float32).to(device)
     with torch.no_grad():
@@ -198,7 +225,10 @@ def main():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     rows = []
     cnt = 0
-    for path in paths_dict:
+    for i, path in enumerate(sorted(paths_dict.keys())):
+        # if i % 2 == 1:
+        if os.path.exists(f"{result_dir}/{path}/log_norm_gauss_GMM_histogram.png"):
+            continue
         print(f"Training {path}...")
         model, losses_history = training_log_norm_gauss(path, base_dir,device=device)
         mu_q, z, labels, rho, pval, gmm_metrics, mixture_metrics = evaluate_log_norm_gauss(model, path, base_dir,device=device)
