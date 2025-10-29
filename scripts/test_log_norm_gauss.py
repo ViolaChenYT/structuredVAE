@@ -75,10 +75,12 @@ def training_log_norm_gauss(path_name, base_dir,device="cpu",batch_size=128,lr=1
         epoch_losses = {}
         for (xb,) in dl:
             if xb.size(0) == 1:
-                print(f"Warning: xb.size(0) == 1, skipping batch")
+                # print(f"Warning: xb.size(0) == 1, skipping batch")
                 continue
             xb = xb.to(device).float()
-            loss, _ = model.variational_inference_step(xb, opt)
+            outputs = model.train_step(xb, opt)
+            # print(outputs)
+            loss = outputs["vae-loss"]
             losses = {"loss": loss}
             # Accumulate losses
             for key, value in losses.items():
@@ -226,18 +228,18 @@ def main():
     rows = []
     cnt = 0
     for i, path in enumerate(sorted(paths_dict.keys())):
-        # if i % 2 == 1:
-        if os.path.exists(f"{result_dir}/{path}/log_norm_gauss_GMM_histogram.png"):
-            continue
-        print(f"Training {path}...")
-        model, losses_history = training_log_norm_gauss(path, base_dir,device=device)
-        mu_q, z, labels, rho, pval, gmm_metrics, mixture_metrics = evaluate_log_norm_gauss(model, path, base_dir,device=device)
-        row = {"path_name":path}
-        print(rho, gmm_metrics)
-        row.update({f"{k}":(v.item() if hasattr(v, 'item') else v) for k, v in gmm_metrics.items()})        
-        row.update({f"{k}":(v.item() if hasattr(v, 'item') else v) for k, v in mixture_metrics.items()})
-        row.update({"correlation":rho, "p_value":pval})
-        rows.append(row)
+        if i % 2 == 1:
+            if os.path.exists(f"{result_dir}/{path}/log_norm_gauss_GMM_histogram.png"):
+                continue
+            print(f"Training {path}...")
+            model, losses_history = training_log_norm_gauss(path, base_dir,device=device)
+            mu_q, z, labels, rho, pval, gmm_metrics, mixture_metrics = evaluate_log_norm_gauss(model, path, base_dir,device=device)
+            row = {"path_name":path}
+            print(rho, gmm_metrics)
+            row.update({f"{k}":(v.item() if hasattr(v, 'item') else v) for k, v in gmm_metrics.items()})        
+            row.update({f"{k}":(v.item() if hasattr(v, 'item') else v) for k, v in mixture_metrics.items()})
+            row.update({"correlation":rho, "p_value":pval})
+            rows.append(row)
         # cnt += 1
         # if cnt > 10:
         #     break
