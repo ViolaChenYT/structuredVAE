@@ -22,7 +22,7 @@ def parse_args():
         description="Prep all paths"
     )
     p.add_argument("--path_dict", type=str, \
-        default = "/n/fs/ragr-data/users/viola/mouse_dev/scripts/new_c_elegans/paths_dict_tree.json.gz", \
+        default = "/n/fs/ragr-data/users/viola/mouse_dev/scripts/new_c_elegans/paths_dict_tree_small.json.gz", \
         help="Input json for path dictionary")
     p.add_argument("--node_abbrev", type=str, \
         default = "/n/fs/ragr-data/users/viola/mouse_dev/scripts/new_c_elegans/original_to_merged.csv", \
@@ -112,7 +112,7 @@ def main():
     adata = sc.read(f"{base_path}/data/packer2019_preprocessed.h5ad")
     
     example_paths = {"MSxap_MSxappppx": ["MSxap", "MSxapp", "MSxappp", "MSxappppx"],}
-    
+    # result = train_scvi_on_path(adata, example_paths["MSxap_MSxappppx"], "MSxap_MSxappppx", base_path, fuzzy_mapping=fuzzy_mapping)
     # Train models for all paths with fuzzy mapping
     print("Training with fuzzy mapping...")
     results = train_scvi_for_paths(adata, path_dict, base_path, fuzzy_mapping=fuzzy_mapping)

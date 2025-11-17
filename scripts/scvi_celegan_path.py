@@ -116,7 +116,7 @@ def train_scvi_on_path(
         
         expanded_lineage_path = list(expanded_lineage_set)
         print(f"Expanded lineage path: {lineage_path} -> {expanded_lineage_path}")
-    
+    else: print("No fuzzy mapping provided, using original lineage path")
     # Default architecture parameters
     if arches_params is None:
         arches_params = dict(
@@ -137,7 +137,8 @@ def train_scvi_on_path(
             early_stopping=True,
             early_stopping_patience=20,
             early_stopping_monitor="elbo_validation",
-            devices=[0],
+            # devices=[0],
+            accelerator="cpu",
         )
     
     # Filter data to expanded lineage path
@@ -175,6 +176,15 @@ def train_scvi_on_path(
     
     # Get latent representation and save processed data
     adata_path.obsm["X_scVI"] = vae.get_latent_representation()
+    
+    # Compute 50-dimensional PCA
+    sc.tl.pca(adata_path, n_comps=50, use_highly_variable=False)
+    # Compute 1D UMAP from 50-dimensional PCA
+    sc.pp.neighbors(adata_path, n_neighbors=15, use_rep='X_pca')
+    sc.tl.umap(adata_path, n_components=1)
+
+    sc.tl.pca(adata_path, n_comps=1, use_highly_variable=False)
+    
     if save_model:
         adata_path.write_h5ad(model_path + '/trained.h5ad')
     
@@ -187,12 +197,12 @@ def train_scvi_on_path(
     
     # Generate plots if requested
     if save_plots:
-        # ELBO training curve
-        train_test_results.iloc[10:].plot(logy=True)
-        plt.xlabel("epochs")
-        plt.ylabel("ELBO")
-        plt.savefig(model_path + "elbo_train_validation_curve.png")
-        plt.close()
+        # # ELBO training curve
+        # train_test_results.iloc[10:].plot(logy=True)
+        # plt.xlabel("epochs")
+        # plt.ylabel("ELBO")
+        # plt.savefig(model_path + "elbo_train_validation_curve.png")
+        # plt.close()
         
         # 1D latent distribution
         arr = adata_path.obsm["X_scVI"].flatten()

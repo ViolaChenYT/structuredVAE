@@ -10,7 +10,7 @@ def parse_args():
         description="Train scVAE on lineage paths using existing loom files from path_dict"
     )
     p.add_argument("--path_dict", type=str, \
-        default = "/n/fs/ragr-data/users/viola/mouse_dev/scripts/new_c_elegans/paths_dict_tree.json.gz", \
+        default = "/n/fs/ragr-data/users/viola/mouse_dev/scripts/new_c_elegans/paths_dict_tree_small.json.gz", \
         help="Input json for path dictionary")
     return p.parse_args()
 

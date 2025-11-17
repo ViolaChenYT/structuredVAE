@@ -286,7 +286,7 @@ def fit_gmm_and_analyze(latent_data, n_components, adata=None, model_name="unkno
         # Ensure we have enough data points for the number of components
         if len(latent_data) < n_components:
             print(f"Warning: Not enough data points ({len(latent_data)}) for {n_components} components in {model_name}")
-            return None
+            return None     
         
         # Fit GMM
         gmm = GaussianMixture(n_components=n_components, random_state=42, max_iter=200)

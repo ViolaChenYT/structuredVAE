@@ -1,6 +1,7 @@
 import os
 import json
 import gzip
+import time
 import pandas as pd
 import numpy as np
 import warnings
@@ -16,13 +17,14 @@ import torch
 from src.models import *
 from src.priors import *
 from torch.utils.data import DataLoader, TensorDataset
-from scipy.stats import entropy,spearmanr
+from scipy.stats import entropy,spearmanr, kendalltau
 from sklearn.mixture import GaussianMixture as GaussianMixture_sklearn
 from sklearn.metrics import silhouette_score, adjusted_rand_score
 from scipy.stats import entropy
 from scipy.spatial.distance import jensenshannon
 import fcntl
 import scanpy as sc
+from itertools import product
 def safe_read_h5ad(filepath):
     max_retries = 5
     for attempt in range(max_retries):
@@ -143,13 +145,14 @@ def compute_correlation(adata, latent_key, labels):
             lambda x: len(x.split("/")[0]) if "/" in x else len(x)
         )
     else:
-        print(f"Warning: No lineage column found in")
-        return None, None
+        print(f"Warning: No lineage column found in adata")
+        return None, None, None, adata
     lineage_numeric = pd.to_numeric(adata.obs[new_key])
     correlation, p_value = spearmanr(lineage_numeric, adata.obsm[latent_key])
-    return abs(correlation), p_value, adata
+    tau, _ = kendalltau(lineage_numeric, adata.obsm[latent_key])
+    return abs(correlation), tau, p_value, adata
 
-def fit_gmm_and_analyze(adata, latent_key):
+def fit_gmm_and_analyze(adata, latent_key, path=None):
     lineage_labels = pd.to_numeric(adata.obs['lineage_category']).values
     n_components = len(set(lineage_labels))
     gmm = GaussianMixture_sklearn(n_components=n_components, random_state=42)
@@ -189,13 +192,22 @@ def fit_gmm_and_analyze(adata, latent_key):
             'mae': mae,
             'rmse': rmse
         }
+    # Calculate silhouette score with error handling
+    try:
+        silhouette_val = silhouette_score(latent_data, cluster_assignments)
+    except ValueError as e:
+        path_msg = f" (path: {path})" if path is not None else ""
+        print(f"Warning: Could not calculate silhouette score{path_msg}: {e}")
+        print(f"  Cluster assignments have {len(np.unique(cluster_assignments))} unique label(s)")
+        silhouette_val = np.nan
+    
     gmm_metrics = {
         'entropy': entropy_value,
         'bic': gmm.bic(latent_data),
         'aic': gmm.aic(latent_data),
         'log_likelihood': gmm.score(latent_data),
         'perplexity': np.exp(-gmm.score(latent_data) / len(latent_data)),
-        'silhouette': silhouette_score(latent_data, gmm.predict(latent_data)),
+        'silhouette': silhouette_val,
         'ari_with_lineage': ari_with_lineage,
     }
     return gmm_metrics, mixture_proportion_metrics
@@ -205,6 +217,7 @@ def evaluate_log_norm_gauss(model, path, base_dir,device="cpu"):
     data = safe_read_h5ad(f"{base_dir}/scvi_path_{path}/trained.h5ad")
     y = data.obs["lineage"]
     X = torch.tensor(data.X.todense(), dtype=torch.float32).to(device)
+    X = scanpy_norm_log1p_from_torch(X)
     with torch.no_grad():
         qz_x = model._define_variational_family(X.float().to(device))
         mu_q = qz_x.mean
@@ -215,30 +228,35 @@ def evaluate_log_norm_gauss(model, path, base_dir,device="cpu"):
     data.write_h5ad(f"{base_dir}/scvi_path_{path}/trained.h5ad")
     labels = y.detach().to("cpu").numpy() if isinstance(y, torch.Tensor) else np.asarray(y)
     plot_histogram(data, latent_key, path)
-    correlation, p_value, data = compute_correlation(data, latent_key, labels)
-    gmm_metrics, mixture_proportion_metrics = fit_gmm_and_analyze(data, latent_key)
-    return mu_q, Z_learned, labels, correlation, p_value, gmm_metrics, mixture_proportion_metrics
+    correlation, tau, p_value, data = compute_correlation(data, latent_key, labels)
+    gmm_metrics, mixture_proportion_metrics = fit_gmm_and_analyze(data, latent_key, path=path)
+    return mu_q, Z_learned, labels, correlation, tau, p_value, gmm_metrics, mixture_proportion_metrics
 
 def main():
     base_dir = "/n/fs/ragr-data/users/viola/structuredVAE/data"
     result_dir = "/n/fs/ragr-data/users/viola/structuredVAE/results/"
-    paths_dict_file = "/n/fs/ragr-data/users/viola/mouse_dev/scripts/new_c_elegans/paths_dict_tree.json.gz"
+    paths_dict_file = "/n/fs/ragr-data/users/viola/mouse_dev/scripts/new_c_elegans/paths_dict_tree_small.json.gz"
     paths_dict = load_paths_dict(paths_dict_file)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     rows = []
     cnt = 0
     for i, path in enumerate(sorted(paths_dict.keys())):
-        if i % 2 == 1:
-            if os.path.exists(f"{result_dir}/{path}/log_norm_gauss_GMM_histogram.png"):
-                continue
+        # if i % 2 == 1:
+            # if os.path.exists(f"{result_dir}/plots/{path}/log_norm_gauss_GMM_histogram.png"):
+            #     continue
             print(f"Training {path}...")
             model, losses_history = training_log_norm_gauss(path, base_dir,device=device)
-            mu_q, z, labels, rho, pval, gmm_metrics, mixture_metrics = evaluate_log_norm_gauss(model, path, base_dir,device=device)
+            mu_q, z, labels, rho, tau, pval, gmm_metrics, mixture_metrics = evaluate_log_norm_gauss(model, path, base_dir,device=device)
             row = {"path_name":path}
             print(rho, gmm_metrics)
             row.update({f"{k}":(v.item() if hasattr(v, 'item') else v) for k, v in gmm_metrics.items()})        
             row.update({f"{k}":(v.item() if hasattr(v, 'item') else v) for k, v in mixture_metrics.items()})
-            row.update({"correlation":rho, "p_value":pval})
+            row.update({"correlation":rho, "kendall_tau":tau, "p_value":pval})
+            # Write per-path CSV immediately for partial results
+            per_path_dir = f"{result_dir}/plots/{path}"
+            if not os.path.exists(per_path_dir):
+                os.makedirs(per_path_dir, exist_ok=True)
+            pd.DataFrame([row]).to_csv(f"{per_path_dir}/metrics.csv", index=False)
             rows.append(row)
         # cnt += 1
         # if cnt > 10:
