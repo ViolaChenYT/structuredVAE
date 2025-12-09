@@ -53,13 +53,23 @@ def main():
     labels = adata_lineagepath.obs["lineage"].tolist()
     unique_labels = np.unique(labels)
 
+    # Get all coordinates to determine global range for shared binning
+    global_min = np.min(latent_z_arr)
+    global_max = np.max(latent_z_arr)
+    # Create shared bin edges (201 edges = 200 bins)
+    # Using more bins since we're now binning across all lineages, not per lineage
+    bin_edges = np.linspace(global_min, global_max, 201)
+
     plt.figure(figsize=(7,5))
     for lab in unique_labels:
         subset = latent_z_arr[np.array(labels) == lab]
-        plt.hist(subset, bins=50, density=True, alpha=0.5, label=str(lab))
+        # Add cell count to legend label
+        n_cells = len(subset)
+        label = f"{lab} (n={n_cells})"
+        plt.hist(subset, bins=bin_edges, density=True, alpha=0.5, label=label)
 
     plt.xlabel("Value")
-    plt.ylabel("Frequency")
+    plt.ylabel("Density")
     plt.title("Frequency Distributions by Label (normalized)")
     plt.legend()
     #plt.show()

@@ -325,15 +325,27 @@ def plot_histogram(adata, latent_key, path, result_dir):
     unique_lineages = sorted(unique_items, key=lambda s: len(s.split('/')[0]))
     colors = plt.cm.Set3(np.linspace(0, 1, len(unique_lineages)))
     
+    # Get all coordinates to determine global range for shared binning
+    all_coords = adata.obsm[latent_key].flatten()
+    global_min = np.min(all_coords)
+    global_max = np.max(all_coords)
+    
+    # Create shared bin edges (201 edges = 200 bins)
+    # Using more bins since we're now binning across all lineages, not per lineage
+    bin_edges = np.linspace(global_min, global_max, 201)
+    
     plt.figure(figsize=(10, 6))
     for i, lineage in enumerate(unique_lineages):
         lineage_coords = adata.obsm[latent_key][adata.obs["lineage"] == lineage]
         if len(lineage_coords) > 0:
-            plt.hist(lineage_coords, bins=50, alpha=0.5, label=lineage, 
+            # Add cell count to legend label
+            n_cells = len(lineage_coords)
+            label = f"{lineage} (n={n_cells})"
+            plt.hist(lineage_coords, bins=bin_edges, alpha=0.5, label=label, 
                     color=colors[i], density=True)
     
     plt.xlabel("Z")
-    plt.ylabel("Frequency")
+    plt.ylabel("Density")
     plt.title(f"Histogram of VMM scVI Z by lineage: {path}")
     plt.legend(title="lineage", bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.grid(True, alpha=0.3)
@@ -582,6 +594,13 @@ def evaluate_vmm_scvi(data, path_name, result_dir, latent_key="vmmscvi"):
 
 def main():
     """Main function to run VMM scVI on all paths."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Train VMM scVI on all lineage paths")
+    parser.add_argument("--remake-plots-only", action="store_true",
+                       help="If set, skip training and only remake plots/evaluations from existing results")
+    args = parser.parse_args()
+    
     # Configuration
     base_dir = "/n/fs/ragr-data/users/viola/structuredVAE/data"
     result_dir = "/n/fs/ragr-data/users/viola/structuredVAE/results/vmm_scvi"
@@ -592,6 +611,9 @@ def main():
     # Load paths
     paths_dict = load_paths_dict(paths_dict_file)
     print(f"Found {len(paths_dict)} paths to process")
+    
+    if args.remake_plots_only:
+        print("Mode: Remake plots only (skipping training)")
     
     # Training configuration
     max_clusters = 5
@@ -606,29 +628,45 @@ def main():
     for i, path_name in enumerate(sorted(paths_dict.keys())):
         # Check if already processed
         plot_path = os.path.join(result_dir, path_name, 'vmm_scvi_histogram.png')
-        if os.path.exists(plot_path):
+        if not args.remake_plots_only and os.path.exists(plot_path):
             print(f"[{i+1}/{len(paths_dict)}] Skipping {path_name} (already processed)")
             continue
         
         print(f"\n[{i+1}/{len(paths_dict)}] Processing {path_name}...")
         
         try:
-            # Train model
-            model, embeddings, cluster_probs, data, history = train_vmm_scvi(
-                path_name=path_name,
-                base_dir=base_dir,
-                result_dir=result_dir,
-                max_clusters=max_clusters,
-                max_epochs=max_epochs,
-                patience=patience,
-                batch_size=batch_size,
-                trial_seed=trial_seed,
-                device=device,
-                use_gpu=True
-            )
-            
-            # Evaluate
-            metrics = evaluate_vmm_scvi(data, path_name, result_dir)
+            if args.remake_plots_only:
+                # Load existing data and remake plots/evaluations
+                data_path = os.path.join(result_dir, path_name, 'trained.h5ad')
+                if not os.path.exists(data_path):
+                    print(f"  Warning: {data_path} not found, skipping")
+                    continue
+                
+                data = anndata.read_h5ad(data_path)
+                if 'vmmscvi' not in data.obsm:
+                    print(f"  Warning: No 'vmmscvi' embeddings found in {data_path}, skipping")
+                    continue
+                
+                print(f"  Remaking plots/evaluations for {path_name}...")
+                # Evaluate without training
+                metrics = evaluate_vmm_scvi(data, path_name, result_dir)
+            else:
+                # Train model
+                model, embeddings, cluster_probs, data, history = train_vmm_scvi(
+                    path_name=path_name,
+                    base_dir=base_dir,
+                    result_dir=result_dir,
+                    max_clusters=max_clusters,
+                    max_epochs=max_epochs,
+                    patience=patience,
+                    batch_size=batch_size,
+                    trial_seed=trial_seed,
+                    device=device,
+                    use_gpu=True
+                )
+                
+                # Evaluate
+                metrics = evaluate_vmm_scvi(data, path_name, result_dir)
             
             print(f"Results for {path_name}:")
             print(f"  Correlation: {metrics['correlation']:.4f}")

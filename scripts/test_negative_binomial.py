@@ -13,19 +13,73 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
 import torch
+import argparse
 from src.models import *
 from src.priors import *
 from torch.utils.data import DataLoader, TensorDataset
-from scipy.stats import entropy,spearmanr, kendalltau
+from scipy.stats import spearmanr, kendalltau
 from sklearn.mixture import GaussianMixture as GaussianMixture_sklearn
-from sklearn.metrics import silhouette_score, adjusted_rand_score
-from scipy.stats import entropy
-from scipy.spatial.distance import jensenshannon
+from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 from itertools import product
+import scanpy as sc
 def load_paths_dict(paths_dict_file):
     """Load the paths dictionary from the compressed JSON file."""
     with gzip.open(paths_dict_file, 'rt') as f:
         return json.load(f)
+
+def expand_choices(items, sep="/", strip=True, dedup=False):
+    """
+    items: list[str] possibly containing 'a/b' meaning choose one
+    returns: list[list[str]] of all expanded lists
+    """
+    opts = []
+    for s in items:
+        parts = s.split(sep)
+        if strip:
+            parts = [p.strip() for p in parts]
+        opts.append(parts if len(parts) > 1 else [parts[0]])
+    combos = [list(choice) for choice in product(*opts)]
+    if dedup:
+        seen = set()
+        uniq = []
+        for c in combos:
+            t = tuple(c)
+            if t not in seen:
+                seen.add(t); uniq.append(c)
+        return uniq
+    return combos
+
+def is_prefix_match(prefix: str, s: str, wildcard: str = "x") -> bool:
+    """Return True iff prefix (with 'x' as single-char wildcard) matches the start of s."""
+    if len(prefix) > len(s):
+        return False
+    for a, b in zip(prefix, s):
+        if a != wildcard and b!=wildcard and a != b:
+            return False
+    return True
+
+def is_prefix_chain_wild(L, wildcard: str = "x") -> bool:
+    """Check L[i] is a wildcard-prefix of L[i+1] for all i."""
+    return all(is_prefix_match(L[i], L[i+1], wildcard) for i in range(len(L) - 1))
+
+def label_order_index(label_list, sep="/", wildcard="x"):
+    # Find the first expanded path whose length-lex order forms a valid wildcard-prefix chain
+    path = next(
+        (sorted(p, key=lambda s: (len(s), s))
+         for p in expand_choices(label_list, sep=sep)
+         if is_prefix_chain_wild(sorted(p, key=lambda s: (len(s), s)), wildcard)),
+        None
+    )
+    if path is None:
+        return {}, 0
+    label_idx = {lab: len(lab) for lab in path}
+    missing_node = int(len(label_idx) < len(path[-1])-len(path[0])+1)
+    origin = {}
+    for lab in label_list:
+        val = next((label_idx[o] for o in lab.split(sep) if o in label_idx), None)
+        if val is not None:
+            origin[lab] = val
+    return origin, missing_node
 def scanpy_norm_log1p_from_torch(X: torch.Tensor) -> torch.Tensor:
     # move to CPU + numpy (Scanpy expects numpy/scipy)
     X_np = X.detach().cpu().numpy().astype(np.float32, copy=False)
@@ -38,8 +92,9 @@ def scanpy_norm_log1p_from_torch(X: torch.Tensor) -> torch.Tensor:
     X_out = torch.from_numpy(adata.X).to(X.device).type_as(X)
     return X_out 
 
-def training_negative_binomial(path_name, base_dir,device="cpu",batch_size=128,lr=1e-3,weight_decay=1e-5,early_stopping=True,patience=200,epochs=700,min_delta=1e-4):
-    data = anndata.read_loom(f"{base_dir}/{path_name}.loom")
+def training_negative_binomial(path_name, base_dir, result_dir, device="cpu",batch_size=128,lr=1e-3,weight_decay=1e-5,early_stopping=True,patience=200,epochs=700,min_delta=1e-4):
+    # data = anndata.read_loom(f"{base_dir}/{path_name}.loom")
+    data = sc.read_h5ad(f"{base_dir}/scvi_path_{path_name}/trained.h5ad")
     n_components = len(set(data.obs['lineage']))
     model_prior = GaussianMixture(latent_dim=1, num_clusters=n_components)
     model_encoder = build_encoder(dim_x=2000, h_dim=64, n_layers=2)
@@ -101,19 +156,61 @@ def training_negative_binomial(path_name, base_dir,device="cpu",batch_size=128,l
     print(f"Final loss: {current_loss:.4f}, Best loss: {best_loss:.4f}")
     print(f"Total epochs: {epoch}")
     
+    # Save losses_history to CSV
+    per_path_dir = os.path.join(result_dir, "plots", path_name)
+    os.makedirs(per_path_dir, exist_ok=True)
+    losses_df = pd.DataFrame(losses_history)
+    losses_df.to_csv(os.path.join(per_path_dir, 'losses_history.csv'), index=False)
+    
     return model, losses_history
+
+def plot_reconstruction_loss(losses_history, path, result_dir):
+    """Plot reconstruction loss from training history."""
+    if losses_history is None or len(losses_history) == 0:
+        return
+    
+    per_path_dir = os.path.join(result_dir, "plots", path)
+    os.makedirs(per_path_dir, exist_ok=True)
+    
+    plt.figure(figsize=(8, 6))
+    epochs = np.arange(1, len(losses_history) + 1)
+    
+    # Extract loss values from losses_history
+    loss_values = [epoch_loss.get('loss', np.nan) for epoch_loss in losses_history]
+    
+    plt.plot(epochs, loss_values, label='Training Loss', alpha=0.7)
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title(f"Reconstruction Loss: {path}")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(per_path_dir, 'reconstruction_loss.png'), dpi=150, bbox_inches='tight')
+    plt.close()
 
 def plot_histogram(adata,latent_key, path, result_dir="/n/fs/ragr-data/users/viola/structuredVAE/results/plots/"):
     labels = adata.obs["lineage"]
     unique_items = set(labels)
     unique_lineages = sorted(unique_items, key=lambda s: len(s.split('/')[0]))
     colors = plt.cm.Set3(np.linspace(0, 1, len(unique_lineages)))
+    
+    # Get all coordinates to determine global range for shared binning
+    all_coords = adata.obsm[latent_key].flatten()
+    global_min = np.min(all_coords)
+    global_max = np.max(all_coords)
+    
+    # Create shared bin edges (201 edges = 200 bins)
+    # Using more bins since we're now binning across all lineages, not per lineage
+    bin_edges = np.linspace(global_min, global_max, 201)
+    
     for i, lineage in enumerate(unique_lineages):
         lineage_coords = adata.obsm[latent_key][adata.obs["lineage"] == lineage]
         if len(lineage_coords) > 0:
-            plt.hist(lineage_coords, bins=50, alpha=0.5, label=lineage, color=colors[i], density=True)
+            # Add cell count to legend label
+            n_cells = len(lineage_coords)
+            label = f"{lineage} (n={n_cells})"
+            plt.hist(lineage_coords, bins=bin_edges, alpha=0.5, label=label, color=colors[i], density=True)
     plt.xlabel("Z")
-    plt.ylabel("Frequency")
+    plt.ylabel("Density")
     plt.title("Histogram of GMMVAE Z by lineage(NB)")
     plt.legend(title="lineage")
     plt.grid(True, alpha=0.3)
@@ -123,130 +220,237 @@ def plot_histogram(adata,latent_key, path, result_dir="/n/fs/ragr-data/users/vio
     plt.close()
     return adata
 
-def compute_correlation(adata, latent_key, labels):
+def compute_correlation(adata, latent_key):
+    """Compute correlation between latent embeddings and lineage depth."""
     new_key = "lineage_category"
     if 'lineage' in adata.obs.columns:
+        label_idx_dict, if_missing = label_order_index(adata.obs["lineage"].unique().tolist())
         adata.obs[new_key] = adata.obs['lineage'].apply(
-            lambda x: len(x.split("/")[0]) if "/" in x else len(x)
+            lambda x: label_idx_dict[x]
         )
     else:
         print(f"Warning: No lineage column found in adata")
-        return None, None, None, adata
-    lineage_numeric = pd.to_numeric(adata.obs[new_key])
-    correlation, p_value = spearmanr(lineage_numeric, adata.obsm[latent_key])
-    tau, _ = kendalltau(lineage_numeric, adata.obsm[latent_key])
-    return abs(correlation), tau, p_value, adata
+        return np.nan, np.nan, adata
+    
+    lineage_numeric = pd.to_numeric(adata.obs[new_key]).values
+    
+    # Flatten latent embeddings to 1D for correlation
+    latent_1d = adata.obsm[latent_key].flatten()
+    
+    # Check for degenerate cases
+    if len(np.unique(lineage_numeric)) < 2 or len(np.unique(latent_1d)) < 2:
+        print(f"Warning: Insufficient variance for correlation (unique lineages: {len(np.unique(lineage_numeric))}, unique latent values: {len(np.unique(latent_1d))})")
+        return np.nan, np.nan, adata
+    
+    try:
+        correlation, p_value = spearmanr(lineage_numeric, latent_1d)
+        tau, _ = kendalltau(lineage_numeric, latent_1d)
+        return abs(correlation), abs(tau), adata
+    except Exception as e:
+        print(f"Warning: Error computing correlation: {e}")
+        return np.nan, np.nan, adata
 
-def fit_gmm_and_analyze(adata, latent_key, path=None):
+def compute_clustering_metrics(adata, latent_key, path=None):
+    """Fit GMM to latent embeddings and compute ARI and NMI with lineage."""
+    if 'lineage_category' not in adata.obs.columns:
+        return np.nan, np.nan
+    
     lineage_labels = pd.to_numeric(adata.obs['lineage_category']).values
     n_components = len(set(lineage_labels))
-    gmm = GaussianMixture_sklearn(n_components=n_components, random_state=42)
-    latent_data = adata.obsm[latent_key].reshape(-1, 1)
-    gmm.fit(latent_data)
-    probabilities = gmm.predict_proba(latent_data)
-    point_entropies = [entropy(probs) for probs in probabilities]
-    entropy_value = np.mean(point_entropies)
-    ari_with_lineage=np.nan
     
-    cluster_assignments = gmm.predict(latent_data)
-    mixture_proportion_metrics = {}
-    if adata is not None and 'lineage_category' in adata.obs.columns:
-        lineage_labels = pd.to_numeric(adata.obs['lineage_category']).values
-        ari_with_lineage = adjusted_rand_score(cluster_assignments, lineage_labels)
-        gmm_proportions = gmm.weights_
-        lineage_counts = np.bincount(lineage_labels.astype(int))
-        lineage_proportions = lineage_counts / np.sum(lineage_counts)
-        # Pad lineage_proportions if it has fewer components than GMM
-        if len(lineage_proportions) < n_components:
-            padded_lineage = np.zeros(n_components)
-            padded_lineage[:len(lineage_proportions)] = lineage_proportions
-            lineage_proportions = padded_lineage
-        elif len(lineage_proportions) > n_components:
-            # Truncate if lineage has more components
-            lineage_proportions = lineage_proportions[:n_components]
-            lineage_proportions = lineage_proportions / np.sum(lineage_proportions)
-        js_divergence = jensenshannon(gmm_proportions, lineage_proportions)
-        kl_divergence = entropy(gmm_proportions, lineage_proportions)
-        lin_correlation = np.corrcoef(gmm_proportions, lineage_proportions)[0, 1]
-        mae = np.mean(np.abs(gmm_proportions - lineage_proportions))
-        rmse = np.sqrt(np.mean((gmm_proportions - lineage_proportions) ** 2))
-        mixture_proportion_metrics = {
-            'js_divergence': js_divergence,
-            'kl_divergence': kl_divergence,
-            'correlation': lin_correlation,
-            'mae': mae,
-            'rmse': rmse
-        }
-    # Calculate silhouette score with error handling
-    try:
-        silhouette_val = silhouette_score(latent_data, cluster_assignments)
-    except ValueError as e:
+    # Handle edge case: insufficient components
+    if n_components < 2:
         path_msg = f" (path: {path})" if path is not None else ""
-        print(f"Warning: Could not calculate silhouette score{path_msg}: {e}")
-        print(f"  Cluster assignments have {len(np.unique(cluster_assignments))} unique label(s)")
-        silhouette_val = np.nan
+        print(f"Warning: Only {n_components} unique lineage(s){path_msg}, skipping clustering metrics")
+        return np.nan, np.nan
     
-    gmm_metrics = {
-        'entropy': entropy_value,
-        'bic': gmm.bic(latent_data),
-        'aic': gmm.aic(latent_data),
-        'log_likelihood': gmm.score(latent_data),
-        'perplexity': np.exp(-gmm.score(latent_data) / len(latent_data)),
-        'silhouette': silhouette_val,
-        'ari_with_lineage': ari_with_lineage,
-    }
-    return gmm_metrics, mixture_proportion_metrics
+    latent_data = adata.obsm[latent_key].reshape(-1, 1)
+    
+    # Check for degenerate data
+    if len(latent_data) < n_components:
+        path_msg = f" (path: {path})" if path is not None else ""
+        print(f"Warning: Insufficient data points ({len(latent_data)}) for {n_components} components{path_msg}")
+        return np.nan, np.nan
+    
+    # Fit GMM
+    gmm = GaussianMixture_sklearn(n_components=n_components, random_state=42)
+    gmm.fit(latent_data)
+    cluster_assignments = gmm.predict(latent_data)
+    
+    # Compute ARI and NMI
+    ari = adjusted_rand_score(cluster_assignments, lineage_labels)
+    try:
+        nmi = normalized_mutual_info_score(lineage_labels, cluster_assignments, average_method='arithmetic')
+    except Exception as e:
+        path_msg = f" (path: {path})" if path is not None else ""
+        print(f"Warning: Could not calculate NMI{path_msg}: {e}")
+        nmi = np.nan
+    
+    return ari, nmi
 
-def evaluate_negative_binomial(model, path, base_dir,device="cpu"):
-    model.eval()
+def evaluate_negative_binomial(model, path, base_dir, result_dir, device="cpu", skip_training=False, losses_history=None):
+    """
+    Evaluate negative binomial model and compute metrics.
+    
+    Args:
+        model: Trained model (can be None if skip_training=True)
+        path: Path name
+        base_dir: Base directory for data
+        result_dir: Directory to save results
+        device: Device to use
+        skip_training: If True, skip model inference and use existing embeddings
+        losses_history: Optional training history for plotting reconstruction loss
+        
+    Returns:
+        metrics: Dictionary with abs_spearman, abs_kendall_tau, ari, nmi
+    """
     data = anndata.read_h5ad(f"{base_dir}/scvi_path_{path}/trained.h5ad")
-    y = data.obs["lineage"]
-    X = torch.tensor(data.X.todense(), dtype=torch.float32).to(device)
-    with torch.no_grad():
-        qz_x = model._define_variational_family(X.float().to(device))
-        mu_q = qz_x.mean
-        Z_learned = qz_x.sample()
-        Z_learned = Z_learned.detach().flatten().to("cpu").numpy()
     latent_key = "Z_learned_nb"
-    data.obsm[latent_key] = mu_q.detach().to("cpu").numpy()
-    data.write_h5ad(f"{base_dir}/scvi_path_{path}/trained.h5ad")
-    labels = y.detach().to("cpu").numpy() if isinstance(y, torch.Tensor) else np.asarray(y)
-    plot_histogram(data, latent_key, path)
-    correlation,tau, p_value, data = compute_correlation(data, latent_key, labels)
-    gmm_metrics, mixture_proportion_metrics = fit_gmm_and_analyze(data, latent_key, path=path)
-    return mu_q, Z_learned, labels, correlation, tau, p_value, gmm_metrics, mixture_proportion_metrics
+    
+    if skip_training:
+        # Use existing embeddings
+        if latent_key not in data.obsm:
+            raise ValueError(f"No {latent_key} embeddings found in trained.h5ad")
+        print(f"  Using existing {latent_key} embeddings")
+    else:
+        # Run model inference
+        model.eval()
+        X = torch.tensor(data.X.todense(), dtype=torch.float32).to(device)
+        
+        with torch.no_grad():
+            qz_x = model._define_variational_family(X.float().to(device))
+            mu_q = qz_x.mean
+        
+        # Save latent embeddings to adata.obsm
+        data.obsm[latent_key] = mu_q.detach().to("cpu").numpy()
+        
+        # Save updated data
+        data.write_h5ad(f"{base_dir}/scvi_path_{path}/trained.h5ad")
+    
+    # Plot histogram
+    plot_histogram(data, latent_key, path, result_dir)
+    
+    # Plot reconstruction loss if available
+    if losses_history is not None:
+        plot_reconstruction_loss(losses_history, path, result_dir)
+    
+    # Compute correlation with lineage
+    correlation, tau, data = compute_correlation(data, latent_key)
+    
+    # Compute clustering metrics (ARI and NMI)
+    ari, nmi = compute_clustering_metrics(data, latent_key, path=path)
+    
+    # Return only requested metrics
+    metrics = {
+        'path_name': path,
+        'abs_spearman': correlation,
+        'abs_kendall_tau': tau,
+        'ari': ari,
+        'nmi': nmi,
+    }
+    
+    return metrics
 
 def main():
+    parser = argparse.ArgumentParser(description="Train negative binomial VAE on all lineage paths")
+    parser.add_argument("--remake-plots-only", action="store_true",
+                       help="If set, skip training and only remake plots/evaluations from existing results")
+    parser.add_argument("--remake-reconstruction-plots-only", action="store_true",
+                       help="If set, only remake reconstruction loss plots from existing losses_history.csv files")
+    args = parser.parse_args()
+    
     base_dir = "/n/fs/ragr-data/users/viola/structuredVAE/data"
-    result_dir = "/n/fs/ragr-data/users/viola/structuredVAE/results/"
-    paths_dict_file = "/n/fs/ragr-data/users/viola/mouse_dev/scripts/new_c_elegans/paths_dict_tree_small.json.gz"
+    result_dir = "/n/fs/ragr-data/users/viola/structuredVAE/results/negative_binomial"
+    paths_dict_file = "/n/fs/ragr-data/users/viola/mouse_dev/scripts/new_c_elegans/paths_dict_tree_new.json.gz"
+    
+    os.makedirs(result_dir, exist_ok=True)
+    
     paths_dict = load_paths_dict(paths_dict_file)
+    print(f"Found {len(paths_dict)} paths to process")
+    
+    if args.remake_reconstruction_plots_only:
+        print("Mode: Remake reconstruction loss plots only (skipping training and other plots)")
+    
     device = "cpu"  #torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     rows = []
-    cnt = 0
+    
     for i, path in enumerate(sorted(paths_dict.keys())):
-            # if os.path.exists(f"{result_dir}/plots/{path}/NB_GMM_histogram.png"):
-            #     continue
-            print(f"Training {path}...")
-            model, losses_history = training_negative_binomial(path, base_dir,device=device)
-            mu_q, z, labels, rho, tau, pval, gmm_metrics, mixture_metrics = evaluate_negative_binomial(model, path, base_dir,device=device)
-            row = {"path_name":path}
-            print(rho, gmm_metrics)
-            row.update({f"{k}":(v.item() if hasattr(v, 'item') else v) for k, v in gmm_metrics.items()})        
-            row.update({f"{k}":(v.item() if hasattr(v, 'item') else v) for k, v in mixture_metrics.items()})
-            row.update({"correlation":rho, "kendall_tau":tau, "p_value":pval})
-            # Write per-path CSV immediately for partial results
-            per_path_dir = f"{result_dir}/plots/{path}"
-            if not os.path.exists(per_path_dir):
-                os.makedirs(per_path_dir, exist_ok=True)
-            pd.DataFrame([row]).to_csv(f"{per_path_dir}/metrics.csv", index=False)
-            rows.append(row)
-        # cnt += 1
-        # if cnt > 10:
-        #     break
+        # Check if already processed (check for metrics.csv file)
+        metrics_path = os.path.join(result_dir, "plots", path, "metrics.csv")
+        if not args.remake_plots_only and not args.remake_reconstruction_plots_only and os.path.exists(metrics_path):
+            print(f"[{i+1}/{len(paths_dict)}] Skipping {path} (already processed)")
+            continue
         
-    df = pd.DataFrame(rows)
-    df.to_csv(f"{result_dir}/negative_binomial_results.csv", index=False)
+        print(f"\n[{i+1}/{len(paths_dict)}] Processing {path}...")
+        
+        try:
+            losses_history = None
+            if args.remake_reconstruction_plots_only:
+                # Only remake reconstruction loss plots
+                losses_path = os.path.join(result_dir, "plots", path, "losses_history.csv")
+                if os.path.exists(losses_path):
+                    losses_df = pd.read_csv(losses_path)
+                    losses_history = losses_df.to_dict('records')
+                    plot_reconstruction_loss(losses_history, path, result_dir)
+                    print(f"✓ Successfully remade reconstruction loss plot for {path}")
+                else:
+                    print(f"  Warning: {losses_path} not found, skipping")
+                continue
+            elif args.remake_plots_only:
+                # Load existing data and remake plots/evaluations
+                data_path = os.path.join(base_dir, f"scvi_path_{path}", "trained.h5ad")
+                if not os.path.exists(data_path):
+                    print(f"  Warning: {data_path} not found, skipping")
+                    continue
+                
+                data = anndata.read_h5ad(data_path)
+                if 'Z_learned_nb' not in data.obsm:
+                    print(f"  Warning: No 'Z_learned_nb' embeddings found in {data_path}, skipping")
+                    continue
+                
+                # Try to load losses_history for plotting
+                losses_path = os.path.join(result_dir, "plots", path, "losses_history.csv")
+                if os.path.exists(losses_path):
+                    losses_df = pd.read_csv(losses_path)
+                    losses_history = losses_df.to_dict('records')
+                
+                print(f"  Remaking plots/evaluations for {path}...")
+                # Evaluate without training
+                metrics = evaluate_negative_binomial(None, path, base_dir, result_dir, device=device, skip_training=True, losses_history=losses_history)
+            else:
+                print(f"Training {path}...")
+                model, losses_history = training_negative_binomial(path, base_dir, result_dir, device=device)
+                
+                # Evaluate
+                metrics = evaluate_negative_binomial(model, path, base_dir, result_dir, device=device, losses_history=losses_history)
+            
+            print(f"Results for {path}:")
+            print(f"  Abs Spearman: {metrics['abs_spearman']:.4f}")
+            print(f"  Abs Kendall's tau: {metrics['abs_kendall_tau']:.4f}")
+            print(f"  ARI: {metrics['ari']:.4f}")
+            print(f"  NMI: {metrics['nmi']:.4f}")
+            
+            # Save per-path metrics
+            per_path_dir = os.path.join(result_dir, "plots", path)
+            os.makedirs(per_path_dir, exist_ok=True)
+            pd.DataFrame([metrics]).to_csv(os.path.join(per_path_dir, 'metrics.csv'), index=False)
+            
+            rows.append(metrics)
+            
+        except Exception as e:
+            print(f"ERROR processing {path}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    # Save aggregated results
+    if rows:
+        df = pd.DataFrame(rows)
+        df.to_csv(os.path.join(result_dir, 'negative_binomial_results.csv'), index=False)
+        print(f"\nSaved aggregated results to {result_dir}/negative_binomial_results.csv")
+        print(f"Processed {len(rows)} paths successfully")
+    else:
+        print("\nNo paths were processed")
         
 
 if __name__ == "__main__":

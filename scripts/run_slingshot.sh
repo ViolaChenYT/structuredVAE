@@ -1,6 +1,6 @@
 #!/usr/bin/bash
 
-zcat /n/fs/ragr-data/users/viola/mouse_dev/scripts/new_c_elegans/paths_dict_tree_small.json.gz \
+zcat /n/fs/ragr-data/users/viola/mouse_dev/scripts/new_c_elegans/paths_dict_tree_new.json.gz \
   | jq -r 'keys[]' \
   | xargs -n1 -P4 -I{} Rscript run_slingshot.R \
       --h5ad /n/fs/ragr-data/users/viola/structuredVAE/data/scvi_path_{}/trained.h5ad \

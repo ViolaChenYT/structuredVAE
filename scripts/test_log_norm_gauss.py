@@ -123,12 +123,25 @@ def plot_histogram(adata,latent_key, path, result_dir="/n/fs/ragr-data/users/vio
     unique_items = set(labels)
     unique_lineages = sorted(unique_items, key=lambda s: len(s.split('/')[0]))
     colors = plt.cm.Set3(np.linspace(0, 1, len(unique_lineages)))
+    
+    # Get all coordinates to determine global range for shared binning
+    all_coords = adata.obsm[latent_key].flatten()
+    global_min = np.min(all_coords)
+    global_max = np.max(all_coords)
+    
+    # Create shared bin edges (201 edges = 200 bins)
+    # Using more bins since we're now binning across all lineages, not per lineage
+    bin_edges = np.linspace(global_min, global_max, 201)
+    
     for i, lineage in enumerate(unique_lineages):
         lineage_coords = adata.obsm[latent_key][adata.obs["lineage"] == lineage]
         if len(lineage_coords) > 0:
-            plt.hist(lineage_coords, bins=50, alpha=0.5, label=lineage, color=colors[i], density=True)
+            # Add cell count to legend label
+            n_cells = len(lineage_coords)
+            label = f"{lineage} (n={n_cells})"
+            plt.hist(lineage_coords, bins=bin_edges, alpha=0.5, label=label, color=colors[i], density=True)
     plt.xlabel("Z")
-    plt.ylabel("Frequency")
+    plt.ylabel("Density")
     plt.title("Histogram of GMMVAE Z by lineage(log-norm-gauss)")
     plt.legend(title="lineage")
     plt.grid(True, alpha=0.3)

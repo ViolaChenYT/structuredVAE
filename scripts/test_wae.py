@@ -38,7 +38,7 @@ from torch.distributions import Categorical, Normal, MixtureSameFamily
 # Import WAE1D from wae1d module
 from wae import WAE1D
 
-from sklearn.metrics import silhouette_score, adjusted_rand_score
+from sklearn.metrics import silhouette_score, adjusted_rand_score, normalized_mutual_info_score
 from scipy.stats import entropy, spearmanr, kendalltau
 from scipy.spatial.distance import jensenshannon
 from sklearn.mixture import GaussianMixture as GaussianMixture_sklearn
@@ -189,7 +189,8 @@ def train_wae(path_name, base_dir, result_dir, max_clusters=5,
         n_layers_dec=n_layers_dec,
         embedding_dim=1,
         likelihood="nb",
-        auto_init=1  # Allow prior initialization from data
+        auto_init=1,  # Allow prior initialization from data
+        device=device
     )
     
     if use_gpu and torch.cuda.is_available():
@@ -326,15 +327,27 @@ def plot_histogram(adata, latent_key, path, result_dir):
     unique_lineages = sorted(unique_items, key=lambda s: len(s.split('/')[0]))
     colors = plt.cm.Set3(np.linspace(0, 1, len(unique_lineages)))
     
+    # Get all coordinates to determine global range for shared binning
+    all_coords = adata.obsm[latent_key].flatten()
+    global_min = np.min(all_coords)
+    global_max = np.max(all_coords)
+    
+    # Create shared bin edges (201 edges = 200 bins)
+    # Using more bins since we're now binning across all lineages, not per lineage
+    bin_edges = np.linspace(global_min, global_max, 201)
+    
     plt.figure(figsize=(10, 6))
     for i, lineage in enumerate(unique_lineages):
         lineage_coords = adata.obsm[latent_key][adata.obs["lineage"] == lineage]
         if len(lineage_coords) > 0:
-            plt.hist(lineage_coords, bins=50, alpha=0.5, label=lineage, 
+            # Add cell count to legend label
+            n_cells = len(lineage_coords)
+            label = f"{lineage} (n={n_cells})"
+            plt.hist(lineage_coords, bins=bin_edges, alpha=0.5, label=label, 
                     color=colors[i], density=True)
     
     plt.xlabel("Z")
-    plt.ylabel("Frequency")
+    plt.ylabel("Density")
     plt.title(f"Histogram of WAE Z by lineage: {path}")
     plt.legend(title="lineage", bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.grid(True, alpha=0.3)
@@ -343,6 +356,44 @@ def plot_histogram(adata, latent_key, path, result_dir):
     plot_dir = os.path.join(result_dir, f"wae_{path}")
     os.makedirs(plot_dir, exist_ok=True)
     plt.savefig(os.path.join(plot_dir, 'wae_histogram.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def plot_reconstruction_loss(history, path_name, result_dir):
+    """Plot reconstruction loss from training history."""
+    if history is None:
+        return
+    
+    # Check if we have any reconstruction loss data
+    has_train = 'train_recon_loss' in history and len(history['train_recon_loss']) > 0
+    has_valid = 'valid_recon_loss' in history and len(history['valid_recon_loss']) > 0
+    
+    if not has_train and not has_valid:
+        print(f"  Warning: No reconstruction loss data found in history for {path_name}")
+        return
+    
+    plot_dir = os.path.join(result_dir, f"wae_{path_name}")
+    os.makedirs(plot_dir, exist_ok=True)
+    
+    plt.figure(figsize=(8, 6))
+    
+    # Determine epoch range from available data
+    if has_train:
+        epochs = np.arange(1, len(history['train_recon_loss']) + 1)
+        plt.plot(epochs, history['train_recon_loss'], label='Train Reconstruction Loss', alpha=0.7)
+    
+    if has_valid:
+        # Use same epoch range or create new one if train doesn't exist
+        if not has_train:
+            epochs = np.arange(1, len(history['valid_recon_loss']) + 1)
+        plt.plot(epochs, history['valid_recon_loss'], label='Validation Reconstruction Loss', alpha=0.7)
+    
+    plt.xlabel("Epoch")
+    plt.ylabel("Reconstruction Loss")
+    plt.title(f"Reconstruction Loss: {path_name}")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(plot_dir, 'reconstruction_loss.png'), dpi=150, bbox_inches='tight')
     plt.close()
 
 
@@ -433,7 +484,7 @@ def compute_correlation(adata, latent_key):
     try:
         correlation, p_value = spearmanr(lineage_numeric, latent_1d)
         tau, _ = kendalltau(lineage_numeric, latent_1d)
-        return abs(correlation), tau, p_value, adata
+        return abs(correlation), abs(tau), p_value, adata
     except Exception as e:
         print(f"Warning: Error computing correlation: {e}")
         return np.nan, np.nan, np.nan, adata
@@ -471,6 +522,14 @@ def fit_gmm_and_analyze(adata, latent_key, path=None):
     
     # ARI with lineage
     ari_with_lineage = adjusted_rand_score(cluster_assignments, lineage_labels)
+    
+    # NMI with lineage
+    try:
+        nmi_with_lineage = normalized_mutual_info_score(lineage_labels, cluster_assignments, average_method='arithmetic')
+    except Exception as e:
+        path_msg = f" (path: {path})" if path is not None else ""
+        print(f"Warning: Could not calculate NMI{path_msg}: {e}")
+        nmi_with_lineage = np.nan
     
     # Mixture proportion metrics
     gmm_proportions = gmm.weights_
@@ -516,12 +575,13 @@ def fit_gmm_and_analyze(adata, latent_key, path=None):
         'perplexity': np.exp(-gmm.score(latent_data) / len(latent_data)),
         'silhouette': silhouette_val,
         'ari_with_lineage': ari_with_lineage,
+        'nmi_with_lineage': nmi_with_lineage,
     }
     
     return gmm_metrics, mixture_proportion_metrics
 
 
-def evaluate_wae(data, path_name, result_dir, latent_key="wae"):
+def evaluate_wae(data, path_name, result_dir, latent_key="wae", history=None):
     """
     Evaluate WAE results and compute metrics.
     
@@ -530,6 +590,7 @@ def evaluate_wae(data, path_name, result_dir, latent_key="wae"):
         path_name: Name of the path
         result_dir: Directory to save results
         latent_key: Key in obsm for latent embeddings
+        history: Optional training history dictionary for plotting reconstruction loss
         
     Returns:
         metrics: Dictionary of evaluation metrics
@@ -540,6 +601,10 @@ def evaluate_wae(data, path_name, result_dir, latent_key="wae"):
     # Plot histogram
     plot_histogram(data, latent_key, path_name, result_dir)
     
+    # Plot reconstruction loss if history is provided
+    if history is not None:
+        plot_reconstruction_loss(history, path_name, result_dir)
+    
     # Fit GMM and analyze
     gmm_metrics, mixture_metrics = fit_gmm_and_analyze(data, latent_key, path=path_name)
     
@@ -547,18 +612,26 @@ def evaluate_wae(data, path_name, result_dir, latent_key="wae"):
     save_path = os.path.join(result_dir, f"wae_{path_name}")
     data.write_h5ad(os.path.join(save_path, 'trained.h5ad'))
     
-    # Combine metrics
+    # Combine metrics - focus on key metrics requested
     metrics = {
         'path_name': path_name,
-        'correlation': correlation,
-        'kendall_tau': tau,
+        'abs_spearman': correlation,  # Already abs from compute_correlation
+        'abs_kendall_tau': tau,  # Already abs from compute_correlation
+        'ari': None,  # Will be filled from gmm_metrics
+        'nmi': None,  # Will be filled from gmm_metrics
         'p_value': p_value,
     }
     
     # Handle None returns from GMM analysis (edge cases)
     if gmm_metrics is not None:
+        # Update key metrics
+        metrics['ari'] = gmm_metrics.get('ari_with_lineage', np.nan)
+        metrics['nmi'] = gmm_metrics.get('nmi_with_lineage', np.nan)
+        # Also include all other metrics
         metrics.update({k: (v.item() if hasattr(v, 'item') else v) for k, v in gmm_metrics.items()})
     else:
+        metrics['ari'] = np.nan
+        metrics['nmi'] = np.nan
         metrics.update({
             'entropy': np.nan,
             'bic': np.nan,
@@ -567,6 +640,7 @@ def evaluate_wae(data, path_name, result_dir, latent_key="wae"):
             'perplexity': np.nan,
             'silhouette': np.nan,
             'ari_with_lineage': np.nan,
+            'nmi_with_lineage': np.nan,
         })
     
     if mixture_metrics is not None:
@@ -585,16 +659,30 @@ def evaluate_wae(data, path_name, result_dir, latent_key="wae"):
 
 def main():
     """Main function to run WAE on all paths."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Train WAE1D on all lineage paths")
+    parser.add_argument("--remake-plots-only", action="store_true",
+                       help="If set, skip training and only remake plots/evaluations from existing results")
+    parser.add_argument("--remake-reconstruction-plots-only", action="store_true",
+                       help="If set, only remake reconstruction loss plots from existing wae_history.pkl files")
+    args = parser.parse_args()
+    
     # Configuration
     base_dir = "/n/fs/ragr-data/users/viola/structuredVAE/data"
     result_dir = "/n/fs/ragr-data/users/viola/structuredVAE/results/wae"
-    paths_dict_file = "/n/fs/ragr-data/users/viola/mouse_dev/scripts/new_c_elegans/paths_dict_tree_small.json.gz"
+    paths_dict_file = "/n/fs/ragr-data/users/viola/mouse_dev/scripts/new_c_elegans/paths_dict_tree_new.json.gz"
     
     os.makedirs(result_dir, exist_ok=True)
     
     # Load paths
     paths_dict = load_paths_dict(paths_dict_file)
     print(f"Found {len(paths_dict)} paths to process")
+    
+    if args.remake_plots_only:
+        print("Mode: Remake plots only (skipping training)")
+    if args.remake_reconstruction_plots_only:
+        print("Mode: Remake reconstruction loss plots only (skipping training and other plots)")
     
     # Training configuration
     max_clusters = 5
@@ -613,37 +701,70 @@ def main():
     for i, path_name in enumerate(sorted(paths_dict.keys())):
         # Check if already processed
         plot_path = os.path.join(result_dir, f"wae_{path_name}", 'wae_histogram.png')
-        if os.path.exists(plot_path):
+        if not args.remake_plots_only and not args.remake_reconstruction_plots_only and os.path.exists(plot_path):
             print(f"[{i+1}/{len(paths_dict)}] Skipping {path_name} (already processed)")
             continue
         
         print(f"\n[{i+1}/{len(paths_dict)}] Processing {path_name}...")
         
         try:
-            # Train model
-            model, embeddings, data, history = train_wae(
-                path_name=path_name,
-                base_dir=base_dir,
-                result_dir=result_dir,
-                max_clusters=max_clusters,
-                max_epochs=max_epochs,
-                warmup_epochs=warmup_epochs,
-                batch_size=batch_size,
-                learning_rate=learning_rate,
-                h_dim=h_dim,
-                n_layers_enc=n_layers_enc,
-                n_layers_dec=n_layers_dec,
-                trial_seed=trial_seed,
-                use_gpu=use_gpu
-            )
+            history = None
+            if args.remake_reconstruction_plots_only:
+                # Only remake reconstruction loss plots
+                history_path = os.path.join(result_dir, f"wae_{path_name}", 'wae_history.pkl')
+                if os.path.exists(history_path):
+                    with open(history_path, 'rb') as f:
+                        history = pickle.load(f)
+                    plot_reconstruction_loss(history, path_name, result_dir)
+                    print(f"✓ Successfully remade reconstruction loss plot for {path_name}")
+                else:
+                    print(f"  Warning: {history_path} not found, skipping")
+                continue
+            elif args.remake_plots_only:
+                # Load existing data and remake plots/evaluations
+                data_path = os.path.join(result_dir, f"wae_{path_name}", 'trained.h5ad')
+                if not os.path.exists(data_path):
+                    print(f"  Warning: {data_path} not found, skipping")
+                    continue
+                
+                data = anndata.read_h5ad(data_path)
+                if 'wae' not in data.obsm:
+                    print(f"  Warning: No 'wae' embeddings found in {data_path}, skipping")
+                    continue
+                
+                # Try to load history for plotting reconstruction loss
+                history_path = os.path.join(result_dir, f"wae_{path_name}", 'wae_history.pkl')
+                if os.path.exists(history_path):
+                    with open(history_path, 'rb') as f:
+                        history = pickle.load(f)
+                
+                print(f"  Remaking plots/evaluations for {path_name}...")
+            else:
+                # Train model
+                model, embeddings, data, history = train_wae(
+                    path_name=path_name,
+                    base_dir=base_dir,
+                    result_dir=result_dir,
+                    max_clusters=max_clusters,
+                    max_epochs=max_epochs,
+                    warmup_epochs=warmup_epochs,
+                    batch_size=batch_size,
+                    learning_rate=learning_rate,
+                    h_dim=h_dim,
+                    n_layers_enc=n_layers_enc,
+                    n_layers_dec=n_layers_dec,
+                    trial_seed=trial_seed,
+                    use_gpu=use_gpu
+                )
             
             # Evaluate
-            metrics = evaluate_wae(data, path_name, result_dir)
+            metrics = evaluate_wae(data, path_name, result_dir, history=history)
             
             print(f"Results for {path_name}:")
-            print(f"  Correlation: {metrics['correlation']:.4f}")
-            print(f"  ARI: {metrics['ari_with_lineage']:.4f}")
-            print(f"  Entropy: {metrics['entropy']:.4f}")
+            print(f"  Abs Spearman: {metrics['abs_spearman']:.4f}")
+            print(f"  Abs Kendall's tau: {metrics['abs_kendall_tau']:.4f}")
+            print(f"  ARI: {metrics['ari']:.4f}")
+            print(f"  NMI: {metrics['nmi']:.4f}")
             
             # Save per-path metrics
             per_path_dir = os.path.join(result_dir, f"wae_{path_name}")
