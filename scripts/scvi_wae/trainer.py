@@ -7,19 +7,13 @@ import scvi
 import torch
 import torch.nn.functional as F
 from scipy.spatial.distance import pdist, squareform
-from scipy.stats import spearmanr
+from scipy.stats import spearmanr, kendalltau
 from sklearn.mixture import GaussianMixture
 from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score
 from torch.utils.data import DataLoader, TensorDataset
 import phate
-
 from scvi_wae.clustering_utils import gmm_cluster_1d
-from scvi_wae.losses import (
-    mixture_uniform_reg,
-    pairwise_distance_loss,
-    wasserstein_distance_1d_learnable,
-    wasserstein_distance_1d_mixture_sample,
-)
+from scvi_wae.losses import *
 from scvi_wae.path_utils import label_order_index
 
 
@@ -34,12 +28,13 @@ def train_and_eval(
     train_prior_mix=False,
     # Training hyperparameters
     epochs=500,
+    warm_up_epochs=50,
     batch_size=128,
     kl_weight=0.0,
     wd_weight=10.0,
     dist_weight=1.0,
     tau_gumbel=1.0,
-    mix_uniform_reg_weight=1.0,
+    mix_uniform_reg_weight=2.0,
     # Optimizer parameters
     lr=1e-3,
     weight_decay=1e-5,
@@ -52,6 +47,8 @@ def train_and_eval(
     # Verbose
     verbose=True,
     print_every=100,
+    plot_weight_history=False,
+    path_name=None,
 ):
     """
     Train and evaluate SCVI-WAE model on AnnData object.
@@ -109,7 +106,11 @@ def train_and_eval(
         Whether to print training progress
     print_every : int
         Print every N epochs
-    
+    plot_weight_history : bool
+        Whether to plot weight history
+    path_name : str
+        Path name for saving weight history plot
+
     Returns
     -------
     dict
@@ -265,8 +266,13 @@ def train_and_eval(
     
     # Training loop
     losses_history = []
-    
+    weight_history = []
     for ep in range(1, epochs + 1):
+        is_warm_up = ep <= warm_up_epochs
+        if is_warm_up:
+            current_mix_logits = torch.zeros_like(mix_logits)
+        else:
+            current_mix_logits = mix_logits
         model.train()
         epoch_ae = {"loss": 0.0, "recon_loss": 0.0, "wd": 0.0, "dist": 0.0}
         for xb, idx in dl:
@@ -292,10 +298,7 @@ def train_and_eval(
                 kl_weight=kl_weight,
             )
             recon_loss = loss_info.reconstruction_loss["reconstruction_loss"].mean()
-            if kl_weight > 0.0:
-                loss = loss_info.loss
-            else:
-                loss = recon_loss
+            loss = loss_info.loss if kl_weight > 0.0 else recon_loss
             
             # Wasserstein distance to GMM prior
             if train_prior_mix:
@@ -303,7 +306,7 @@ def train_and_eval(
                     inference_outputs["z"],
                     centroids.detach(),
                     log_stds.detach(),
-                    mix_logits.detach(),
+                    current_mix_logits.detach(),
                     tau=tau_gumbel,
                 )
             else:
@@ -343,7 +346,6 @@ def train_and_eval(
             for xb, idx in dl:
                 xb = xb.to(device).float()
                 idx = idx.to(device)
-                
                 bsz = xb.size(0)
                 batch_tmp = batch_int_tensor[idx.long()]
                 labels_tmp = torch.zeros((bsz, 1), device=device, dtype=torch.long)
@@ -362,7 +364,7 @@ def train_and_eval(
                         z_detached,
                         centroids,
                         log_stds,
-                        mix_logits,
+                        current_mix_logits,
                         tau=tau_gumbel,
                     )
                 else:
@@ -372,13 +374,20 @@ def train_and_eval(
                         log_stds,
                     )
                 # regularize mixture weights toward uniform (only matters if train_prior_mix=True)
+                current_probs = torch.softmax(mix_logits, dim=0)
                 if mix_uniform_reg_weight > 0.0 and train_prior_mix:
-                    reg_mix = mixture_uniform_reg(mix_logits)
+                    # reg_mix = mixture_uniform_reg(current_mix_logits)
+                    reg_mix = dirichlet_prior_loss(current_probs, alpha=2.0) 
                 else:
                     reg_mix = z_detached.new_zeros(())
                 # total prior loss
                 loss_prior = wd_weight * wd_prior + mix_uniform_reg_weight * reg_mix
+
+        
+
                 loss_prior.backward()
+                if is_warm_up and train_prior_mix and mix_logits.grad is not None:
+                    mix_logits.grad.data.zero_()
                 opt_prior.step()
                 
                 epoch_prior["loss"] += loss_prior.item() * bsz
@@ -413,16 +422,21 @@ def train_and_eval(
         
         # Print progress
         if verbose and (ep == 1 or ep % print_every == 0 or ep == epochs):
+            phase_str = "WARM-UP" if is_warm_up else "LEARN-MIX"
             print(
-                f"[{ep:03d}] "
+                f"[{ep:03d}] {phase_str} "
                 f"AE: loss={epoch_ae['loss']:.3f}, recon={epoch_ae['recon_loss']:.3f}, "
-                f"wd={epoch_ae['wd']:.3f}, dist={epoch_ae['dist']:.3f}"
+                f"wd={wd_weight*epoch_ae['wd']:.3f}, dist={epoch_ae['dist']:.3f}"
             )
             if opt_prior is not None and wd_weight > 0:
                 print(
-                    f"      Prior: loss={epoch_prior['loss']:.3f}, wd={epoch_prior['wd']:.3f}"
+                    f"      Prior: loss={epoch_prior['loss']:.3f}, wd={wd_weight*epoch_prior['wd']:.3f}"
                 )
-    
+        if is_warm_up:
+            prob = np.array([1/n_clusters for _ in range(n_clusters)])
+        else:
+            prob = torch.softmax(mix_logits, dim=0).detach().to("cpu").numpy()
+        weight_history.append(prob)
     # After training evaluation
     model.eval()
     with torch.no_grad():
@@ -433,10 +447,12 @@ def train_and_eval(
         inference_outputs = model._regular_inference(**inference_inputs)
         mu_q = inference_outputs["qz"].mean
         mu = mu_q.detach().flatten().to("cpu").numpy()
-    
+        
     # Compute evaluation metrics
     r, p = spearmanr(mu.reshape(-1), np.array(lineage_label))
     abs_r = abs(r)
+    tau, p_value = kendalltau(mu.reshape(-1), np.array(lineage_label))
+    abs_tau = abs(tau)
     
     # Two different ways to compute NMI/ARI
     inbuilt_labels, inbuilt_resp, _ = gmm_cluster_1d(
@@ -463,6 +479,7 @@ def train_and_eval(
     eval_results = {
         "spearman_r": abs_r,
         "spearman_p": p,
+        "kendall_tau": abs_tau,
         "nmi_inbuilt": nmi_inbuilt,
         "ari_inbuilt": ari_inbuilt,
         "nmi_gmm": nmi_gmm,
@@ -473,7 +490,7 @@ def train_and_eval(
         print(f"Spearman correlation: {abs_r:.4f}")
         print(f"Inbuilt GMM - NMI: {nmi_inbuilt:.4f}, ARI: {ari_inbuilt:.4f}")
         print(f"Sklearn GMM - NMI: {nmi_gmm:.4f}, ARI: {ari_gmm:.4f}")
-    
+        
     return {
         "model": model,
         "vae": vae,
@@ -484,4 +501,5 @@ def train_and_eval(
         "eval_results": eval_results,
         "lineage_label": lineage_label,
         "mu": mu,
+        "weight_history": np.array(weight_history),
     }

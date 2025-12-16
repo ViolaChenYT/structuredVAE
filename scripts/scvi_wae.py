@@ -27,10 +27,10 @@ def parse_args():
         default = "/n/fs/ragr-data/users/viola/mouse_dev/scripts/new_c_elegans/paths_dict_min15.json.gz", \
         help="Input json for path dictionary")
     p.add_argument("--output_csv", type=str, \
-        default = "/n/fs/ragr-data/users/viola/structuredVAE/results/scvi_wae_metrics.csv", \
+        default = "/n/fs/ragr-data/users/viola/structuredVAE/results/scvi_wae_metrics_v5.csv", \
         help="Output CSV file path for evaluation metrics")
     p.add_argument("--output_dir", type=str, \
-        default = "/n/fs/ragr-data/users/viola/structuredVAE/results/scvi_wae_results", \
+        default = "/n/fs/ragr-data/users/viola/structuredVAE/results/scvi_wae_results_v5", \
         help="Output directory for full results pickle files")
     return p.parse_args()
 
@@ -49,7 +49,7 @@ if __name__ == '__main__':
         print(f"Training SCVI-WAE for {path_name}")
         try:
             adata = sc.read(f"/n/fs/ragr-data/users/viola/structuredVAE/data/scvi_path_{path_name}/trained.h5ad")
-            results = train_and_eval(adata)
+            results = train_and_eval(adata, train_prior_mix=True, wd_weight=10.0)
             
             # Prepare results dictionary for saving (convert tensors to numpy)
             results_to_save = {}
@@ -74,7 +74,31 @@ if __name__ == '__main__':
                 else:
                     # Other types (scalars, strings, etc.)
                     results_to_save[key] = value
-            
+            # Plot weight history
+            import matplotlib.pyplot as plt
+            weight_history = results["weight_history"]
+            if weight_history is None or len(weight_history) == 0:
+                print(f"  Warning: weight_history is empty for {path_name}, skipping plot")
+            else:
+                weight_history = np.array(weight_history)
+                # Handle case where weight_history might be 1D or 2D
+                if weight_history.ndim == 1:
+                    weight_history = weight_history.reshape(-1, 1)
+                
+                n_clusters = weight_history.shape[1]
+                plt.figure(figsize=(10, 5))
+                
+                # Plot all clusters dynamically
+                for i in range(n_clusters):
+                    plt.plot(weight_history[:, i], label=f"Cluster {i+1} Weight")
+                plt.axvline(x=50, color='r', linestyle='--', label="Warm-Up Ends (Epoch 50)")
+                plt.xlabel("Epoch")
+                plt.ylabel("Mixture Weight")
+                plt.title(f"Mixture Weights over Time - {path_name}")
+                plt.legend()
+                plt.grid(True, alpha=0.3)
+                plt.savefig(f"/n/fs/ragr-data/users/viola/structuredVAE/results/scvi_wae_results_v5/weight_history_{path_name}.png")
+                plt.close()  # Free memory
             # Save full results to pickle file
             output_pickle = os.path.join(args.output_dir, f"{path_name}_results.pkl")
             with open(output_pickle, "wb") as f:
@@ -94,6 +118,7 @@ if __name__ == '__main__':
                 "path_name": path_name,
                 "spearman_r": eval_results["spearman_r"],
                 "spearman_p": eval_results["spearman_p"],
+                "kendall_tau": eval_results["kendall_tau"],
                 "nmi_inbuilt": eval_results["nmi_inbuilt"],
                 "ari_inbuilt": eval_results["ari_inbuilt"],
                 "nmi_gmm": eval_results["nmi_gmm"],
@@ -110,6 +135,7 @@ if __name__ == '__main__':
                 "path_name": path_name,
                 "spearman_r": None,
                 "spearman_p": None,
+                "kendall_tau": None,
                 "nmi_inbuilt": None,
                 "ari_inbuilt": None,
                 "nmi_gmm": None,

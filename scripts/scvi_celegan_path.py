@@ -46,7 +46,7 @@ def train_scvi_on_path(
     base_path: str = "/n/fs/ragr-data/users/viola/structuredVAE/",
     save_loom: bool = False,
     save_model: bool = True,
-    save_plots: bool = True,
+    save_plots: bool = False,
     arches_params: Optional[Dict[str, Any]] = None,
     training_params: Optional[Dict[str, Any]] = None,
     group_to_nodes: Optional[Dict[str, list]] = None,

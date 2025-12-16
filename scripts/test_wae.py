@@ -671,7 +671,7 @@ def main():
     # Configuration
     base_dir = "/n/fs/ragr-data/users/viola/structuredVAE/data"
     result_dir = "/n/fs/ragr-data/users/viola/structuredVAE/results/wae"
-    paths_dict_file = "/n/fs/ragr-data/users/viola/mouse_dev/scripts/new_c_elegans/paths_dict_tree_new.json.gz"
+    paths_dict_file = "/n/fs/ragr-data/users/viola/mouse_dev/scripts/new_c_elegans/paths_dict_min15.json.gz"
     
     os.makedirs(result_dir, exist_ok=True)
     

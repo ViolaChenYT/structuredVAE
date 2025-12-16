@@ -361,7 +361,7 @@ def main():
     
     base_dir = "/n/fs/ragr-data/users/viola/structuredVAE/data"
     result_dir = "/n/fs/ragr-data/users/viola/structuredVAE/results/negative_binomial"
-    paths_dict_file = "/n/fs/ragr-data/users/viola/mouse_dev/scripts/new_c_elegans/paths_dict_tree_new.json.gz"
+    paths_dict_file = "/n/fs/ragr-data/users/viola/mouse_dev/scripts/new_c_elegans/paths_dict_min15.json.gz"
     
     os.makedirs(result_dir, exist_ok=True)
     
@@ -377,9 +377,9 @@ def main():
     for i, path in enumerate(sorted(paths_dict.keys())):
         # Check if already processed (check for metrics.csv file)
         metrics_path = os.path.join(result_dir, "plots", path, "metrics.csv")
-        if not args.remake_plots_only and not args.remake_reconstruction_plots_only and os.path.exists(metrics_path):
-            print(f"[{i+1}/{len(paths_dict)}] Skipping {path} (already processed)")
-            continue
+        # if not args.remake_plots_only and not args.remake_reconstruction_plots_only and os.path.exists(metrics_path):
+        #     print(f"[{i+1}/{len(paths_dict)}] Skipping {path} (already processed)")
+        #     continue
         
         print(f"\n[{i+1}/{len(paths_dict)}] Processing {path}...")
         

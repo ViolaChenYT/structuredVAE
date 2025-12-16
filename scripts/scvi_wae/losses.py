@@ -170,3 +170,14 @@ def mixture_uniform_reg(mix_logits: torch.Tensor) -> torch.Tensor:
     K = pi.size(0)
     uniform = pi.new_full((K,), 1.0 / K)
     return torch.sum((pi - uniform) ** 2)
+
+def dirichlet_prior_loss(probs, alpha=2.0):
+    """
+    Penalizes probabilities that become too small.
+    alpha > 1.0 encourages uniform-ish distribution but allows variance.
+    alpha = 1.0 is uniform (no penalty).
+    alpha < 1.0 encourages sparsity.
+    """
+    # Probs is softmax(logits)
+    # Add epsilon for numerical stability
+    return -torch.sum((alpha - 1) * torch.log(probs + 1e-6))
