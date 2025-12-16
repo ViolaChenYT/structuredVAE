@@ -249,8 +249,11 @@ def train_and_eval(
                     data_batch = mu_sort
                 means.append(float(np.median(data_batch)))
                 stds.append(float(np.std(data_batch)))
-            
-            means_t = torch.tensor(means, device=device, dtype=torch.float32)
+            means_np = np.array(means)
+            if np.std(means_np) < 0.2:
+                print("!!! Centroids initialized too close. Forcing separation.")
+                means_np = np.linspace(-1.0, 1.0, n_clusters)
+            means_t = torch.tensor(means_np, device=device, dtype=torch.float32)
             stds_t = torch.tensor(stds, device=device, dtype=torch.float32)
             stds_t = torch.clamp(stds_t, min=1e-3)
             
@@ -377,7 +380,7 @@ def train_and_eval(
                 current_probs = torch.softmax(mix_logits, dim=0)
                 if mix_uniform_reg_weight > 0.0 and train_prior_mix:
                     # reg_mix = mixture_uniform_reg(current_mix_logits)
-                    reg_mix = dirichlet_prior_loss(current_probs, alpha=2.0) 
+                    reg_mix = dirichlet_prior_loss(current_probs, alpha=1.1) 
                 else:
                     reg_mix = z_detached.new_zeros(())
                 # total prior loss

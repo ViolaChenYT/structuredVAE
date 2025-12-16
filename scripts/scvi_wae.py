@@ -27,10 +27,10 @@ def parse_args():
         default = "/n/fs/ragr-data/users/viola/mouse_dev/scripts/new_c_elegans/paths_dict_min15.json.gz", \
         help="Input json for path dictionary")
     p.add_argument("--output_csv", type=str, \
-        default = "/n/fs/ragr-data/users/viola/structuredVAE/results/scvi_wae_metrics_v5.csv", \
+        default = "/n/fs/ragr-data/users/viola/structuredVAE/results/scvi_wae_metrics_v6.csv", \
         help="Output CSV file path for evaluation metrics")
     p.add_argument("--output_dir", type=str, \
-        default = "/n/fs/ragr-data/users/viola/structuredVAE/results/scvi_wae_results_v5", \
+        default = "/n/fs/ragr-data/users/viola/structuredVAE/results/scvi_wae_results_v6", \
         help="Output directory for full results pickle files")
     return p.parse_args()
 
@@ -97,7 +97,7 @@ if __name__ == '__main__':
                 plt.title(f"Mixture Weights over Time - {path_name}")
                 plt.legend()
                 plt.grid(True, alpha=0.3)
-                plt.savefig(f"/n/fs/ragr-data/users/viola/structuredVAE/results/scvi_wae_results_v5/weight_history_{path_name}.png")
+                plt.savefig(f"/n/fs/ragr-data/users/viola/structuredVAE/results/scvi_wae_results_v6/weight_history_{path_name}.png")
                 plt.close()  # Free memory
             # Save full results to pickle file
             output_pickle = os.path.join(args.output_dir, f"{path_name}_results.pkl")

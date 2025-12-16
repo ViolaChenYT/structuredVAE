@@ -124,7 +124,67 @@ def wasserstein_distance_1d_learnable(
     wd = F.mse_loss(z_sorted, prior_sorted, reduction="sum") / B
     return wd
 
+def sliced_wasserstein_2d_mixture(z, centroids, log_stds, mix_logits, n_projections=50):
+    """
+    Approximates 2D Wasserstein distance by projecting onto random 1D lines.
+    """
+    device = z.device
+    batch_size = z.size(0)
+    
+    # 1. Sample from the GMM Prior
+    # We need to generate a 'fake' batch from the prior to compare against
+    z_prior = sample_gmm_2d(batch_size, centroids, log_stds, mix_logits)
+    
+    # 2. Generate Random Projections (theta)
+    # Random vectors on the unit circle
+    theta = torch.randn(n_projections, 2, device=device)
+    theta = theta / torch.norm(theta, dim=1, keepdim=True) # Normalize
+    
+    # 3. Project both distributions
+    # shapes: [Batch, 2] @ [2, Projections] -> [Batch, Projections]
+    proj_z = z @ theta.t()
+    proj_prior = z_prior @ theta.t()
+    
+    # 4. Sort and Compute L2 distance (1D Wasserstein)
+    proj_z_sorted, _ = torch.sort(proj_z, dim=0)
+    proj_prior_sorted, _ = torch.sort(proj_prior, dim=0)
+    
+    # Average over batch and projections
+    wd = torch.mean((proj_z_sorted - proj_prior_sorted) ** 2)
+    return wd
 
+def sample_gmm_2d(batch_size, centroids, log_stds, mix_logits):
+    """Helper to sample from differentiable GMM parameters"""
+    # 1. Sample Cluster Assignments (Gumbel-Softmax or Categorical)
+    probs = torch.softmax(mix_logits, dim=0)
+    # For sampling, we can just use multinomial since we don't differentiate 
+    # through the discrete choice, only the resulting Gaussian parameters
+    indices = torch.multinomial(probs, batch_size, replacement=True)
+    
+    # 2. Gather Mean/Std for each sample
+    mu = centroids[indices] # [Batch, 2]
+    std = torch.exp(log_stds[indices]) # [Batch, 2] (assuming diagonal cov)
+    
+    # 3. Reparameterization Trick
+    eps = torch.randn_like(mu)
+    return mu + eps * std
+
+def sample_gmm_2d(batch_size, centroids, log_stds, mix_logits):
+    """Helper to sample from differentiable GMM parameters"""
+    # 1. Sample Cluster Assignments (Gumbel-Softmax or Categorical)
+    probs = torch.softmax(mix_logits, dim=0)
+    # For sampling, we can just use multinomial since we don't differentiate 
+    # through the discrete choice, only the resulting Gaussian parameters
+    indices = torch.multinomial(probs, batch_size, replacement=True)
+    
+    # 2. Gather Mean/Std for each sample
+    mu = centroids[indices] # [Batch, 2]
+    std = torch.exp(log_stds[indices]) # [Batch, 2] (assuming diagonal cov)
+    
+    # 3. Reparameterization Trick
+    eps = torch.randn_like(mu)
+    return mu + eps * std
+    
 def pairwise_distance_loss(
     z: torch.Tensor,
     batch_indices: torch.Tensor,
